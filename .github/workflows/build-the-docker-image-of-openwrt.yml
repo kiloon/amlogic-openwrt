@@ -49,5 +49,312 @@ jobs:
     steps:
 
       # --------------------------------------------------------------------------
-      # Checkout repositor
+      # Checkout repository
+      # --------------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+      # --------------------------------------------------------------------------
+      # Clean up Docker images safely
+      # --------------------------------------------------------------------------
+      - name: Remove existing Docker images
+        run: |
+          set -euo pipefail
+
+          images="$(docker images -q)"
+
+          if [[ -n "${images}" ]]; then
+            echo "Removing existing Docker images:"
+            echo "${images}"
+            docker rmi ${images}
+          else
+            echo "No Docker images to remove."
+          fi
+
+
+      # --------------------------------------------------------------------------
+      # Determine settings
+      # --------------------------------------------------------------------------
+      - name: Determine build settings
+        id: settings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_BRANCH="${{ inputs.source_branch }}"
+          DOCKER_IMAGE="${{ inputs.docker_img }}"
+
+          # repository_dispatch fallback
+          if [[ -z "${SOURCE_BRANCH}" ]]; then
+            SOURCE_BRANCH="${{ github.event.client_payload.source_branch }}"
+          fi
+
+          if [[ -z "${DOCKER_IMAGE}" ]]; then
+            DOCKER_IMAGE="${{ github.event.client_payload.docker_img }}"
+          fi
+
+          # Defaults
+          SOURCE_BRANCH="${SOURCE_BRANCH:-lede}"
+          DOCKER_IMAGE="${DOCKER_IMAGE:-ophub/openwrt-aarch64:latest}"
+
+          echo "SOURCE_BRANCH=${SOURCE_BRANCH}"
+          echo "DOCKER_IMAGE=${DOCKER_IMAGE}"
+
+          echo "source_branch=${SOURCE_BRANCH}" >> "${GITHUB_OUTPUT}"
+          echo "docker_img=${DOCKER_IMAGE}" >> "${GITHUB_OUTPUT}"
+
+
+      # --------------------------------------------------------------------------
+      # Download OpenWrt rootfs
+      # --------------------------------------------------------------------------
+      - name: Download OpenWrt rootfs file [ ${{ steps.settings.outputs.source_branch }} ]
+        id: down
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_BRANCH="${{ steps.settings.outputs.source_branch }}"
+
+          echo "Searching GitHub Releases for OpenWrt rootfs..."
+          echo "Source branch: ${SOURCE_BRANCH}"
+
+          mkdir -p openwrt
+
+          RELEASE_INFO="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+            jq -r --arg branch "${SOURCE_BRANCH}" '
+              .[]
+              | select(.draft == false)
+              | . as $release
+              | .assets[]
+              | select(.name | test("rootfs\\.tar\\.gz$"))
+              | select(.name | contains($branch))
+              | [
+                  $release.tag_name,
+                  .name,
+                  .browser_download_url
+                ]
+              | @tsv
+            ' |
+            head -n 1
+          )"
+
+          if [[ -z "${RELEASE_INFO}" ]]; then
+            echo "::error::OpenWrt rootfs file was not found."
+            echo
+            echo "Available rootfs assets:"
+            echo "----------------------------------------"
+
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+            jq -r '
+              .[]
+              | select(.draft == false)
+              | .tag_name as $tag
+              | .assets[]
+              | select(.name | test("rootfs"))
+              | "\($tag)\t\(.name)"
+            ' || true
+
+            echo "----------------------------------------"
+            exit 1
+          fi
+
+          IFS=$'\t' read -r RELEASE_TAG ASSET_NAME DOWNLOAD_URL <<< "${RELEASE_INFO}"
+
+          echo "Release: ${RELEASE_TAG}"
+          echo "Asset:   ${ASSET_NAME}"
+          echo "URL:     ${DOWNLOAD_URL}"
+
+          OUTPUT_FILE="openwrt/openwrt-armvirt-64-default-rootfs.tar.gz"
+
+          echo "Downloading rootfs..."
+
+          curl -fL \
+            --retry 5 \
+            --retry-delay 5 \
+            --connect-timeout 30 \
+            --output "${OUTPUT_FILE}" \
+            "${DOWNLOAD_URL}"
+
+          if [[ ! -s "${OUTPUT_FILE}" ]]; then
+            echo "::error::Downloaded rootfs file is empty."
+            exit 1
+          fi
+
+          echo
+          echo "Downloaded rootfs:"
+          ls -lh "${OUTPUT_FILE}"
+
+          echo "status=success" >> "${GITHUB_OUTPUT}"
+
+
+      # --------------------------------------------------------------------------
+      # Build Docker filesystem
+      # --------------------------------------------------------------------------
+      - name: Build the Docker image
+        id: make
+        if: ${{ steps.down.outputs.status == 'success' && !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Using build script:"
+          echo "${MAKE_DOCKER_SH}"
+
+          if [[ ! -f "${MAKE_DOCKER_SH}" ]]; then
+            echo "::error::Docker build script not found: ${MAKE_DOCKER_SH}"
+            exit 1
+          fi
+
+          chmod +x "${MAKE_DOCKER_SH}"
+
+          echo "Running Docker image creation script..."
+          "${MAKE_DOCKER_SH}"
+
+          echo
+          echo "Checking Docker build output..."
+
+          if [[ ! -d "${DOCKER_OUTPATH}" ]]; then
+            echo "::error::Docker output directory '${DOCKER_OUTPATH}' was not created."
+
+            echo
+            echo "Current directory:"
+            pwd
+
+            echo
+            echo "Directory contents:"
+            ls -lah
+
+            echo
+            echo "Subdirectories:"
+            find . -maxdepth 2 -type d -print
+
+            exit 1
+          fi
+
+          echo
+          echo "Docker build output:"
+          find "${DOCKER_OUTPATH}" -maxdepth 2 -type f -print
+
+          echo
+          echo "Output directory:"
+          ls -lah "${DOCKER_OUTPATH}"
+
+          echo "status=success" >> "${GITHUB_OUTPUT}"
+
+
+      # --------------------------------------------------------------------------
+      # QEMU
+      # --------------------------------------------------------------------------
+      - name: Set up QEMU
+        id: qemu
+        if: ${{ steps.make.outputs.status == 'success' && !cancelled() }}
+        uses: docker/setup-qemu-action@v3
+
+
+      # --------------------------------------------------------------------------
+      # Docker Buildx
+      # --------------------------------------------------------------------------
+      - name: Set up Docker Buildx
+        id: buildx
+        if: ${{ steps.make.outputs.status == 'success' && !cancelled() }}
+        uses: docker/setup-buildx-action@v3
+
+
+      # --------------------------------------------------------------------------
+      # Check Docker Hub credentials
+      # --------------------------------------------------------------------------
+      - name: Check Docker Hub credentials
+        id: docker_credentials
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${DOCKERHUB_USERNAME}" && -n "${DOCKERHUB_PASSWORD}" ]]; then
+            echo "Docker Hub credentials are available."
+            echo "available=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Docker Hub credentials are NOT configured."
+            echo "available=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+
+      # --------------------------------------------------------------------------
+      # Login to Docker Hub
+      # --------------------------------------------------------------------------
+      - name: Login to Docker Hub
+        id: login
+        if: ${{ steps.docker_credentials.outputs.available == 'true' && !cancelled() }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+
+      # --------------------------------------------------------------------------
+      # Push Docker image
+      # --------------------------------------------------------------------------
+      - name: Push to Docker Hub
+        id: push
+        if: ${{ steps.make.outputs.status == 'success' && steps.login.outcome == 'success' && !cancelled() }}
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          platforms: linux/arm64
+          context: ${{ env.DOCKER_OUTPATH }}
+          tags: ${{ steps.settings.outputs.docker_img }}
+          provenance: false
+          sbom: false
+
+
+      # --------------------------------------------------------------------------
+      # Build without pushing when Docker Hub credentials aren't configured
+      # --------------------------------------------------------------------------
+      - name: Build Docker image without pushing
+        id: local_build
+        if: ${{ steps.make.outputs.status == 'success' && steps.login.outcome != 'success' && !cancelled() }}
+        uses: docker/build-push-action@v6
+        with:
+          push: false
+          platforms: linux/arm64
+          context: ${{ env.DOCKER_OUTPATH }}
+          tags: ${{ steps.settings.outputs.docker_img }}
+          provenance: false
+          sbom: false
+
+
+      # --------------------------------------------------------------------------
+      # Summary
+      # --------------------------------------------------------------------------
+      - name: Build summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "OpenWrt Docker build summary"
+          echo "========================================"
+          echo "Repository:    ${GITHUB_REPOSITORY}"
+          echo "Branch:        ${{ steps.settings.outputs.source_branch }}"
+          echo "Docker image:  ${{ steps.settings.outputs.docker_img }}"
+          echo "Rootfs status: ${{ steps.down.outcome }}"
+          echo "Build status:  ${{ steps.make.outcome }}"
+          echo "Docker login:  ${{ steps.login.outcome }}"
+          echo "Docker push:   ${{ steps.push.outcome }}"
+          echo "========================================"
 ```
+
+This version will **not fail just because the GitHub runner has no Docker images**, and it won't attempt to push unless Docker Hub credentials are actually available. The rootfs step also prints the available release assets if its filename matching fails.
