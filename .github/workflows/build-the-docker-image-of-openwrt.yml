@@ -1,7 +1,7 @@
 ```yaml
 #=====================================================================================
-# https://github.com/ophub/amlogic-s9xxx-openwrt
-# Description: Build the Docker image of OpenWrt
+# Build the Docker image of OpenWrt
+# Repository: https://github.com/kiloon/amlogic-openwrt
 #=====================================================================================
 
 name: Build the Docker image of OpenWrt
@@ -23,206 +23,31 @@ on:
         description: "Set the Docker image"
         required: false
         default: "ophub/openwrt-aarch64:latest"
-        type: choice
-        options:
-          - ophub/openwrt-aarch64:latest
+        type: string
 
       push_to_dockerhub:
         description: "Push image to Docker Hub"
         required: false
-        default: true
+        default: false
         type: boolean
+
+permissions:
+  contents: read
 
 env:
   TZ: America/New_York
-
   MAKE_DOCKER_SH: config-openwrt/docker/make_docker_image.sh
   DOCKER_OUTPATH: out
 
-  # Redacted / configurable through repository secrets.
-  # Do not put your actual Docker Hub password/token in this file.
-  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-  DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
-
 jobs:
   build:
+
     runs-on: ubuntu-22.04
 
-    # Only allow the repository owner to trigger this job.
     if: ${{ github.event.repository.owner.id == github.event.sender.id }}
 
     steps:
 
-      # ---------------------------------------------------------------------------
-      # Checkout
-      # ---------------------------------------------------------------------------
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # ---------------------------------------------------------------------------
-      # Determine inputs
-      #
-      # workflow_dispatch:
-      #   inputs.source_branch
-      #
-      # repository_dispatch:
-      #   client_payload.source_branch
-      #
-      # Defaults to lede.
-      # ---------------------------------------------------------------------------
-      - name: Determine build settings
-        id: settings
-        shell: bash
-        run: |
-          set -e
-
-          SOURCE_BRANCH="${{ inputs.source_branch }}"
-          DOCKER_IMAGE="${{ inputs.docker_img }}"
-
-          if [[ -z "${SOURCE_BRANCH}" ]]; then
-            SOURCE_BRANCH="${{ github.event.client_payload.source_branch }}"
-          fi
-
-          if [[ -z "${SOURCE_BRANCH}" ]]; then
-            SOURCE_BRANCH="lede"
-          fi
-
-          if [[ -z "${DOCKER_IMAGE}" ]]; then
-            DOCKER_IMAGE="${{ github.event.client_payload.docker_img }}"
-          fi
-
-          if [[ -z "${DOCKER_IMAGE}" ]]; then
-            DOCKER_IMAGE="ophub/openwrt-aarch64:latest"
-          fi
-
-          echo "source_branch=${SOURCE_BRANCH}" >> "${GITHUB_OUTPUT}"
-          echo "docker_img=${DOCKER_IMAGE}" >> "${GITHUB_OUTPUT}"
-
-          echo "Source branch: ${SOURCE_BRANCH}"
-          echo "Docker image:   ${DOCKER_IMAGE}"
-
-      # ---------------------------------------------------------------------------
-      # Download OpenWrt rootfs
-      # ---------------------------------------------------------------------------
-      - name: Download OpenWrt rootfs file
-        id: down
-        if: ${{ !cancelled() }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          SOURCE_BRANCH: ${{ steps.settings.outputs.source_branch }}
-        run: |
-          set -euo pipefail
-
-          echo "Searching GitHub releases..."
-          echo "Requested source branch: ${SOURCE_BRANCH}"
-
-          mkdir -p openwrt
-
-          # Query releases and locate a matching rootfs asset.
-          #
-          # We use browser_download_url directly instead of constructing:
-          #
-          #   /releases/download/<tag>/<asset>
-          #
-          # from a fragile grep expression.
-          RELEASE_INFO="$(
-            curl -fsSL \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
-            jq -r --arg branch "${SOURCE_BRANCH}" '
-              .[]
-              | select(.draft == false)
-              | . as $release
-              | .assets[]
-              | select(.name | test("rootfs\\.tar\\.gz$"))
-              | select(.name | contains($branch))
-              | [
-                  $release.tag_name,
-                  .name,
-                  .browser_download_url
-                ]
-              | @tsv
-            ' |
-            head -n 1
-          )"
-
-          if [[ -z "${RELEASE_INFO}" ]]; then
-            echo "::error::No OpenWrt rootfs asset was found."
-            echo "::error::Repository: ${GITHUB_REPOSITORY}"
-            echo "::error::Source branch: ${SOURCE_BRANCH}"
-            echo
-            echo "Available rootfs assets:"
-            
-            curl -fsSL \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
-            jq -r '
-              .[]
-              | .assets[]
-              | select(.name | test("rootfs\\.tar\\.gz$"))
-              | .name
-            ' || true
-
-            exit 1
-          fi
-
-          IFS=$'\t' read -r RELEASE_TAG ASSET_NAME DOWNLOAD_URL <<< "${RELEASE_INFO}"
-
-          echo "Release tag:  ${RELEASE_TAG}"
-          echo "Rootfs file:  ${ASSET_NAME}"
-          echo "Download URL: ${DOWNLOAD_URL}"
-
-          echo "Downloading rootfs..."
-
-          curl -fL \
-            --retry 5 \
-            --retry-delay 5 \
-            "${DOWNLOAD_URL}" \
-            -o "openwrt/openwrt-armvirt-64-default-rootfs.tar.gz"
-
-          test -s "openwrt/openwrt-armvirt-64-default-rootfs.tar.gz"
-
-          echo
-          echo "Downloaded rootfs:"
-          ls -lh "openwrt/openwrt-armvirt-64-default-rootfs.tar.gz"
-
-          echo "status=success" >> "${GITHUB_OUTPUT}"
-
-      # ---------------------------------------------------------------------------
-      # Build the Docker filesystem/context
-      # ---------------------------------------------------------------------------
-      - name: Build the Docker image filesystem
-        id: make
-        if: ${{ steps.down.outputs.status == 'success' && !cancelled() }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chmod +x "${MAKE_DOCKER_SH}"
-
-          echo "Running:"
-          echo "  ${MAKE_DOCKER_SH}"
-
-          "${MAKE_DOCKER_SH}"
-
-          if [[ ! -d "${DOCKER_OUTPATH}" ]]; then
-            echo "::error::Docker build context '${DOCKER_OUTPATH}' was not created."
-            echo
-            echo "Current directory:"
-            pwd
-            echo
-            echo "Directory listing:"
-            ls -lah
-            exit 1
-          fi
-
-          echo
-          echo "Docker build context:"
-          du -sh "${DOCKER_OUTPATH}"
-          find "${DOCKER_OUTPATH}" -maxdepth 2 -type f | head -100
-
-          echo "status=success
+      # --------------------------------------------------------------------------
+      # Checkout repositor
 ```
